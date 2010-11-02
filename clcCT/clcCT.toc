@@ -1,0 +1,6 @@
+## Interface: 40000
+## Title: clcCT
+## Author: clc
+
+config.lua
+core.lua
