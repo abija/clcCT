@@ -3,9 +3,15 @@ local modName, mod = ...
 
 local format = string.format
 local GetTime = GetTime
+local band = bit.band
 
 mod.output = {}
 local AddText
+
+local blacklist = mod.blacklist
+local mergelist = mod.mergelist
+
+local eh, meh, qMerge, doMerge, pmqElapsed = {}, {}, {}, false, 0
 
 -- defines
 --------------------------------------------------------------------------------
@@ -13,7 +19,17 @@ local NUM_FONTSTRINGS = 10
 
 local pname = UnitName("player")
 local pguid = UnitGUID("player")
-local petguid = UnitGUID("playerpet")
+local petflags = bit.bor(
+	-- can be pet or guardian or ....
+	-- COMBATLOG_OBJECT_TYPE_PET, 
+	COMBATLOG_OBJECT_CONTROL_PLAYER,
+	COMBATLOG_OBJECT_REACTION_FRIENDLY,
+	COMBATLOG_OBJECT_AFFILIATION_MINE
+)
+
+local verbose = mod.config.verbose
+
+
 local _, _, texSwing = GetSpellInfo(20597)
 
 -- SPELL_SCHOOL_STRINGS
@@ -96,11 +112,14 @@ local ecs = {
 	SPELL_DAMAGE = "|cffffff00%s",
 	SPELL_MISSED = "|cffffff00%s",
 	SPELL_HEAL = "|cff00ff00%s",
+	SPELL_ENERGIZE = "|cff00ffff%s",
 }
+ecs.SPELL_PERIODIC_DAMAGE = ecs.SPELL_DAMAGE
+ecs.SPELL_PERIODIC_HEAL = ecs.SPELL_HEAL
+ecs.SPELL_PERIODIC_ENERGIZE = ecs.SPELL_ENERGIZE
 
 -- event handlers
 --------------------------------------------------------------------------------
-local eh = {}
 function eh.SWING_DAMAGE(source, dest, ...)
 	return DamageFormat(...)
 end
@@ -113,9 +132,18 @@ function eh.SWING_MISSED(source, dest, t, amount)
 end
 
 function eh.SPELL_DAMAGE(source, dest, id, name, school, amount, overkill, school, resisted, blocked, absorbed, critical, glancing, crushing)
-	if not mod.blacklist[id] then
-		local _, _, icon = GetSpellInfo(id)
-		return DamageFormat(amount, overkill, school, resisted, blocked, absorbed, critical, glancing, crushing), icon
+	if not blacklist[id] then
+		if mergelist[id] and source == pname then
+			meh.DAMAGE(id, amount, critical)
+		else
+			local _, _, icon = GetSpellInfo(id)
+			--[[
+			if verbose then
+				return format("%s [%d] %s", DamageFormat(amount, overkill, school, resisted, blocked, absorbed, critical, glancing, crushing), id, name), icon
+			end
+			--]]
+			return DamageFormat(amount, overkill, school, resisted, blocked, absorbed, critical, glancing, crushing), icon
+		end
 	end
 end
 eh.RANGE_DAMAGE = eh.SPELL_DAMAGE
@@ -125,7 +153,7 @@ eh.DAMAGE_SHIELD = eh.SPELL_DAMAGE
 eh.DAMAGE_SPLIT = eh.SPELL_DAMAGE
 
 function eh.SPELL_MISSED(source, dest, id, name, school, t, amount)
-	if not mod.blacklist[id] then
+	if not blacklist[id] then
 		local _, _, icon = GetSpellInfo(id)
 		t = _G[t]
 		if amount then
@@ -144,16 +172,25 @@ function eh.ENVIRONMENTAL_DAMAGE(source, dest, t, ...)
 end
 
 function eh.SPELL_HEAL(source, dest, id, name, school, amount, overheal, absorb, critical)
-	if not mod.blacklist[id] then
-		local _, _, icon = GetSpellInfo(id)
-		return HealFormat(dest, amount, overheal, absorb, critical), icon
+	if not blacklist[id] then
+		if mergelist[id] and source == pname then
+			meh.HEAL(id, amount, overheal, critical)
+		else
+			local _, _, icon = GetSpellInfo(id)
+			--[[
+			if verbose then
+				return format("%s [%d] %s", HealFormat(dest, amount, overheal, absorb, critical), id, name)), icon
+			end
+			--]]
+			return HealFormat(dest, amount, overheal, absorb, critical), icon
+		end
 	end
 end
 eh.SPELL_PERIODIC_HEAL = eh.SPELL_HEAL
 
 -- TODO not tested
 function eh.SPELL_ENERGIZE(source, dest, id, name, school, amount, t, extra)
-	if amount > mod.mins.energize and not mod.blacklist[id] then
+	if amount > mod.mins.energize and not blacklist[id] then
 		local _, _, icon = GetSpellInfo(id)
 		return format("+%d %s", amount, STRINGS_POWER_TYPE[t+1]), icon
 	end
@@ -168,7 +205,7 @@ eh.SPELL_PERIODIC_LEECH = eh.SPELL_LEECH
 function eh.SPELL_INTERRUPT(source, dest, id, name, school, extraId, extraName, extraSchool)
 	if not extraId then return end
 	local _, _, icon = GetSpellInfo(id)
-	return format("%s %s %s", INTERRUPT, extraName, STRINGS_SPELL_SCHOOL[extraSchool]), icon
+	return format("%s %s %s", INTERRUPT, extraName or "", STRINGS_SPELL_SCHOOL[extraSchool]), icon
 end
 
 function eh.SPELL_DISPEL(source, dest, id, name, school, extraId, extraName, extraSchool, auraType)
@@ -178,9 +215,108 @@ function eh.SPELL_DISPEL(source, dest, id, name, school, extraId, extraName, ext
 end
 eh.SPELL_STOLEN = eh.SPELL_DISPEL
 
+
+-- merge event handlers
+--------------------------------------------------------------------------------
+local meh_DAMAGE = {}
+local function meh_clear_DAMAGE(t)
+	t.amount, t.hits, t.crits = 0, 0, 0
+end
+local function meh_display_DAMAGE(t)
+	local _, _, icon = GetSpellInfo(t.id)
+	if t.crits > 0 then
+		AddText("outgoing", format("|cffffff00%d (%d, %d)", t.amount, t.hits, t.crits), icon)
+	else
+		AddText("outgoing", format("|cffffff00%d (%d)", t.amount, t.hits), icon)
+	end
+end
+function meh.DAMAGE(id, amount, critical)
+	if not blacklist[id] then
+		if not meh_DAMAGE[id] then
+			meh_DAMAGE[id] = {
+				clear = meh_clear_DAMAGE,
+				display = meh_display_DAMAGE,
+				id = id, amount = 0, hits = 0, crits = 0
+			}
+		end
+		local t = meh_DAMAGE[id]
+		t.amount = t.amount + amount
+		t.hits = t.hits + 1
+		t.crits = t.crits + (critical or 0)
+		
+		qMerge[meh_DAMAGE[id]] = true
+		pmqElapsed = 0
+		doMerge = true
+	end
+end
+
+local meh_HEAL = {}
+local function meh_clear_HEAL(t)
+	t.amount, t.overheal, t.hits, t.crits = 0, 0, 0, 0
+end
+local function meh_display_HEAL(t)
+	local _, _, icon = GetSpellInfo(t.id)
+	if t.overheal > 0 then
+		if t.crits > 0 then
+			AddText("outgoing", format("|cff00ff00+%d (O:%d) (%d, %d)", t.amount, t.overheal, t.hits, t.crits), icon)
+		else
+			AddText("outgoing", format("|cff00ff00+%d (O:%d) (%d)", t.amount, t.overheal, t.hits), icon)
+		end
+	else
+		if t.crits > 0 then
+			AddText("outgoing", format("|cff00ff00+%d (%d, %d)", t.amount, t.hits, t.crits), icon)
+		else
+			AddText("outgoing", format("|cff00ff00+%d (%d)", t.amount, t.hits), icon)
+		end
+	end
+end
+function meh.HEAL(id, amount, overheal, critical)
+	if not blacklist[id] then
+		if not meh_HEAL[id] then
+			meh_HEAL[id] = {
+				clear = meh_clear_HEAL,
+				display = meh_display_HEAL,
+				id = id, amount = 0, overeheal = 0, hits = 0, crits = 0
+			}
+		end
+		local t = meh_HEAL[id]
+		t.amount = t.amount + amount
+		t.overheal = t.overheal + overheal
+		t.hits = t.hits + 1
+		t.crits = t.crits + (critical or 0)
+		
+		qMerge[meh_HEAL[id]] = true
+		pmqElapsed = 0
+		doMerge = true
+	end
+end
+
+-- merge queue
+--------------------------------------------------------------------------------
+local pmqThrottle = mod.config.throttleMerge
+local function ProcessMergeQueue(self, elapsed)
+	if doMerge then
+		pmqElapsed = pmqElapsed + elapsed
+		if pmqElapsed < pmqThrottle then return end
+		pmqElapsed = 0
+	
+		local t = next(qMerge)
+		while t do
+			t.display(t)
+			t.clear(t)
+			qMerge[t] = nil
+			t = next(qMerge)
+		end
+		doMerge = false
+	end
+	pmqElapsed = 0
+end
+
+
+-- CLEU
 --------------------------------------------------------------------------------
 local function CLEU(f, e, timestamp, event, sourceGUID, sourceName, sourceFlags, destGUID, destName, destFlags, ...)
-	print(timestamp, event, sourceName, destName, destFlags, ...)
+	--print(timestamp, event, sourceName, sourceFlags, destName, destFlags, ...)
 	if sourceGUID == pguid then
 		if eh[event] then
 			local text, icon = eh[event](sourceName, destName, ...)
@@ -189,7 +325,8 @@ local function CLEU(f, e, timestamp, event, sourceGUID, sourceName, sourceFlags,
 				AddText("outgoing", text, icon)
 			end
 		end
-	elseif petguid == sourceGUID then 
+	-- check for pet
+	elseif petflags == band(sourceFlags or 0, petflags) then 
 		if eh[event] then
 			local text, icon = eh[event](sourceName, destName, ...)
 			if text then
@@ -330,19 +467,21 @@ mod.output.incoming = f
 
 -- start watching
 local ef = CreateFrame("Frame")
-ef:Hide()
+-- onevent -> cleu
 ef:SetScript("OnEvent", CLEU)
 ef:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+-- onupdate -> process queue
+ef:SetScript("OnUpdate", ProcessMergeQueue)
 
-
--- rest of events
-local function EventHandler(self, event, ...)
-	local arg1 = ...
-	if arg1 == "player" then
-		petguid = UnitGUID("playerpet")
+-- other events
+local function OnEvent(self, event, ...)
+	if event == "PLAYER_ENTERING_WORLD" then
+		pguid = UnitGUID("player")
 	end
 end
-local ref = CreateFrame("Frame")
-ref:Hide()
-ref:SetScript("OnEvent", EventHandler)
-ref:RegisterEvent("UNIT_PET")
+local oef = CreateFrame("Frame")
+oef:Hide()
+oef:SetScript("OnEvent", OnEvent)
+oef:RegisterEvent("PLAYER_ENTERING_WORLD")
+
+
